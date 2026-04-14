@@ -41,6 +41,10 @@ export interface FEMResult {
   maxDisplacement: number;
   minStress: number;
   maxStress: number;
+  /** true when the stiffness matrix was (near-)singular → mechanism */
+  isMechanism: boolean;
+  /** free DOFs whose pivot was ~0, indicating zero-stiffness directions */
+  singularDOFs: number[];
 }
 
 /** Assemble global stiffness matrix and solve Ku=f */
@@ -114,7 +118,8 @@ export function solveFEM(input: FEMInput): FEMResult {
   }
 
   // --- Solve K*u = f using Gaussian elimination ---
-  const u = gaussElimination(K, f, nDOF);
+  const singularDOFs: number[] = [];
+  const u = gaussElimination(K, f, nDOF, fixedDOFs, singularDOFs);
 
   // --- Compute axial forces / stresses ---
   const axialForces = new Float64Array(elements.length);
@@ -147,26 +152,40 @@ export function solveFEM(input: FEMInput): FEMResult {
     axialStresses[ei] = force / A;
   }
 
-  const maxDisp = Math.max(...Array.from(u).map(Math.abs));
+  const dispArr = Array.from(u);
+  const hasNaN = dispArr.some(v => !isFinite(v));
+  const maxDisp = hasNaN ? Infinity : Math.max(...dispArr.map(Math.abs));
   const stressArr = Array.from(axialStresses);
-  const minStress = Math.min(...stressArr);
-  const maxStress = Math.max(...stressArr);
+  const minStress = Math.min(...stressArr.filter(isFinite));
+  const maxStress = Math.max(...stressArr.filter(isFinite));
+  const isMechanism = singularDOFs.length > 0 || hasNaN;
 
   return {
     displacements: u,
     axialForces,
     axialStresses,
     maxDisplacement: maxDisp,
-    minStress,
-    maxStress,
+    minStress: isFinite(minStress) ? minStress : 0,
+    maxStress: isFinite(maxStress) ? maxStress : 0,
+    isMechanism,
+    singularDOFs,
   };
 }
 
-/** Simple Gaussian elimination with partial pivoting. Returns solution vector u. */
-function gaussElimination(K: Float64Array, f: Float64Array, n: number): Float64Array {
+/** Simple Gaussian elimination with partial pivoting. Returns solution vector u.
+ *  singularDOFs is populated with column indices whose pivot was ~0 (free DOF = mechanism). */
+function gaussElimination(
+  K: Float64Array,
+  f: Float64Array,
+  n: number,
+  fixedDOFs: Set<number>,
+  singularDOFs: number[],
+): Float64Array {
   // Work on copies
   const A = new Float64Array(K);
   const b = new Float64Array(f);
+  // Track original column indices through row swaps (to map back to DOF numbers)
+  const colIdx = Array.from({ length: n }, (_, i) => i);
 
   for (let col = 0; col < n; col++) {
     // Partial pivot
@@ -177,23 +196,26 @@ function gaussElimination(K: Float64Array, f: Float64Array, n: number): Float64A
       if (v > maxVal) { maxVal = v; maxRow = row; }
     }
     if (maxRow !== col) {
-      // Swap rows
       for (let j = 0; j < n; j++) {
-        const tmp = A[col * n + j];
-        A[col * n + j] = A[maxRow * n + j];
-        A[maxRow * n + j] = tmp;
+        const tmp = A[col * n + j]; A[col * n + j] = A[maxRow * n + j]; A[maxRow * n + j] = tmp;
       }
       const tmp = b[col]; b[col] = b[maxRow]; b[maxRow] = tmp;
+      const ti = colIdx[col]; colIdx[col] = colIdx[maxRow]; colIdx[maxRow] = ti;
     }
 
     const pivot = A[col * n + col];
-    if (Math.abs(pivot) < 1e-14) continue; // singular / constrained
+    // Threshold relative to max diagonal for detecting singularity
+    if (Math.abs(pivot) < 1e-10) {
+      // Only flag as mechanism if this is NOT a fixed DOF (those have diag=1 exactly)
+      if (!fixedDOFs.has(colIdx[col])) {
+        singularDOFs.push(colIdx[col]);
+      }
+      continue;
+    }
 
     for (let row = col + 1; row < n; row++) {
       const factor = A[row * n + col] / pivot;
-      for (let j = col; j < n; j++) {
-        A[row * n + j] -= factor * A[col * n + j];
-      }
+      for (let j = col; j < n; j++) A[row * n + j] -= factor * A[col * n + j];
       b[row] -= factor * b[col];
     }
   }
@@ -204,7 +226,7 @@ function gaussElimination(K: Float64Array, f: Float64Array, n: number): Float64A
     let sum = b[i];
     for (let j = i + 1; j < n; j++) sum -= A[i * n + j] * x[j];
     const diag = A[i * n + i];
-    x[i] = Math.abs(diag) > 1e-14 ? sum / diag : 0;
+    x[i] = Math.abs(diag) > 1e-10 ? sum / diag : 0;
   }
   return x;
 }
@@ -374,5 +396,61 @@ export function buildGridTower(): TrussModel {
     for (let iz = 0; iz <= nBayZ; iz++)
       fixedNodes.push(idx[0][ix][iz]);
 
+  return { nodes, elements, fixedNodes };
+}
+
+// ---------------------------------------------------------------------------
+// Unstable / degenerate topology examples
+// ---------------------------------------------------------------------------
+
+/**
+ * Straight horizontal chain: n nodes equally spaced along X, connected in a
+ * single line, both ends fixed.
+ *
+ * This is a MECHANISM under transverse (gravity) load — the stiffness matrix
+ * is singular for all y/z DOFs, so the solver will flag isMechanism = true
+ * and displacements will be zero (no lateral stiffness at all).
+ */
+export function buildStraightChain(nNodes = 8, length = 4.0): TrussModel {
+  const nodes: Node[] = [];
+  for (let i = 0; i < nNodes; i++) {
+    nodes.push({ id: i, x: (i / (nNodes - 1)) * length, y: 0, z: 0 });
+  }
+  const elements: Element[] = [];
+  for (let i = 0; i < nNodes - 1; i++) {
+    elements.push({ id: i, nodeA: i, nodeB: i + 1 });
+  }
+  // Fix both ends (all 3 DOFs)
+  const fixedNodes = [0, nNodes - 1];
+  return { nodes, elements, fixedNodes };
+}
+
+/**
+ * Pre-sagged catenary chain: same topology as the straight chain, but nodes
+ * are placed along a parabolic curve (y = -sag * 4x/L*(1-x/L)).
+ *
+ * Because elements are no longer collinear, they CAN develop lateral
+ * components and the structure IS stable under gravity — this is the
+ * principle behind suspension cables and catenary bridges.
+ *
+ * Under self-weight the chain further sags and each element is in tension.
+ */
+export function buildCatenaryChain(
+  nNodes = 12,
+  length = 4.0,
+  sag = 0.6,
+): TrussModel {
+  const nodes: Node[] = [];
+  for (let i = 0; i < nNodes; i++) {
+    const t = i / (nNodes - 1); // 0 → 1
+    const x = t * length;
+    const y = -sag * 4 * t * (1 - t); // parabolic sag, max at mid-span
+    nodes.push({ id: i, x, y, z: 0 });
+  }
+  const elements: Element[] = [];
+  for (let i = 0; i < nNodes - 1; i++) {
+    elements.push({ id: i, nodeA: i, nodeB: i + 1 });
+  }
+  const fixedNodes = [0, nNodes - 1];
   return { nodes, elements, fixedNodes };
 }

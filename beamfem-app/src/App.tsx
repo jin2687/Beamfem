@@ -1,28 +1,39 @@
 import { useState, useCallback } from 'react';
-import { Play, RotateCcw, Layers } from 'lucide-react';
+import { Play, RotateCcw, Layers, AlertTriangle } from 'lucide-react';
 import SimulationCanvas from './components/SimulationCanvas';
 import {
   solveFEM,
   buildCubeTruss,
   buildBridgeTruss,
   buildGridTower,
+  buildStraightChain,
+  buildCatenaryChain,
   type FEMResult,
   type TrussModel,
 } from './logic/femSolver';
 
-type PresetName = 'cube' | 'bridge' | 'tower';
+type PresetName = 'cube' | 'bridge' | 'tower' | 'chain-straight' | 'chain-catenary';
 
 const PRESETS: Record<PresetName, () => TrussModel> = {
   cube: () => buildCubeTruss(1.0),
   bridge: () => buildBridgeTruss(),
   tower: () => buildGridTower(),
+  'chain-straight': () => buildStraightChain(10, 4.0),
+  'chain-catenary': () => buildCatenaryChain(14, 4.0, 0.7),
 };
 
 const PRESET_LABELS: Record<PresetName, string> = {
   cube: 'Cube Truss',
   bridge: 'Bridge',
   tower: 'Grid Tower',
+  'chain-straight': 'Straight Chain ⚠',
+  'chain-catenary': 'Catenary Chain',
 };
+
+const PRESET_GROUPS: { label: string; names: PresetName[] }[] = [
+  { label: 'Standard', names: ['cube', 'bridge', 'tower'] },
+  { label: 'Chain / Degenerate', names: ['chain-straight', 'chain-catenary'] },
+];
 
 function SliderRow({
   label,
@@ -139,23 +150,29 @@ export default function App() {
           {/* Preset selector */}
           <section>
             <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Preset Model</h2>
-            <div className="flex flex-col gap-1.5">
-              {(Object.keys(PRESETS) as PresetName[]).map(name => (
-                <button
-                  key={name}
-                  onClick={() => loadPreset(name)}
-                  className={`text-sm px-3 py-1.5 rounded text-left transition-colors ${
-                    preset === name
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                  }`}
-                >
-                  {PRESET_LABELS[name]}
-                  <span className="ml-2 text-xs text-slate-400">
-                    {model.nodes.length === 0 || preset !== name ? '' :
-                      `${model.nodes.length}n / ${model.elements.length}e`}
-                  </span>
-                </button>
+            <div className="flex flex-col gap-3">
+              {PRESET_GROUPS.map(group => (
+                <div key={group.label}>
+                  <p className="text-xs text-slate-600 mb-1">{group.label}</p>
+                  <div className="flex flex-col gap-1">
+                    {group.names.map(name => (
+                      <button
+                        key={name}
+                        onClick={() => loadPreset(name)}
+                        className={`text-sm px-3 py-1.5 rounded text-left transition-colors ${
+                          preset === name
+                            ? 'bg-blue-600 text-white'
+                            : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                        }`}
+                      >
+                        {PRESET_LABELS[name]}
+                        <span className="ml-2 text-xs opacity-60">
+                          {preset === name ? `${model.nodes.length}n / ${model.elements.length}e` : ''}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
             <p className="text-xs text-slate-500 mt-1.5">
@@ -271,22 +288,40 @@ export default function App() {
           />
         </div>
 
+        {/* Mechanism warning banner */}
+        {solved && result?.isMechanism && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 flex items-start gap-2 bg-amber-950/90 backdrop-blur px-4 py-2.5 rounded-xl border border-amber-600 shadow-xl max-w-md">
+            <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="text-amber-300 text-xs font-semibold">機構（Mechanism）検出 — 剛性行列が特異</p>
+              <p className="text-amber-500 text-xs mt-0.5">
+                この構造は横方向の剛性がゼロです。トラス要素は軸力しか伝えないため、
+                すべての要素が同一直線上に並ぶと横荷重に抵抗できません。
+                ノードを曲線状に配置（Catenary Chain）すれば安定します。
+              </p>
+              <p className="text-amber-600 text-xs mt-0.5">
+                特異 DOF 数: {result.singularDOFs.length}
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Results overlay */}
         {solved && result && (
           <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex gap-3 bg-slate-900/90 backdrop-blur px-4 py-2.5 rounded-xl border border-slate-700 shadow-xl">
             <StatBadge
               label="Max |disp|"
-              value={`${fmtSci(result.maxDisplacement * 1000)} mm`}
-              color="text-green-300"
+              value={result.isMechanism ? '∞ (機構)' : `${fmtSci(result.maxDisplacement * 1000)} mm`}
+              color={result.isMechanism ? 'text-amber-400' : 'text-green-300'}
             />
             <StatBadge
               label="Max stress"
-              value={`${fmtSci(result.maxStress / 1e6)} MPa`}
+              value={result.isMechanism ? '—' : `${fmtSci(result.maxStress / 1e6)} MPa`}
               color="text-red-300"
             />
             <StatBadge
               label="Min stress"
-              value={`${fmtSci(result.minStress / 1e6)} MPa`}
+              value={result.isMechanism ? '—' : `${fmtSci(result.minStress / 1e6)} MPa`}
               color="text-blue-300"
             />
             <StatBadge
